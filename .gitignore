@@ -1,0 +1,13 @@
+# Ignore data files and environment variables
+data_raw/*.json
+
+# Ignore environment variable files
+.env
+
+# Ignore virtual environments and dependencies
+venv/
+node_modules/
+__pycache__/
+
+# Ignore system files
+.DS_Store
