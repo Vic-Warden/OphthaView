@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-
+# Load all JSON files in the folder as DataFrames, keyed by filename stem
 def load_all_data(data_folder: str = "data_raw") -> dict:
     """
     Load every JSON file in the given folder into a dict of DataFrames.
@@ -15,41 +15,29 @@ def load_all_data(data_folder: str = "data_raw") -> dict:
     print(f"[LOAD] {len(dfs)} file(s) loaded: {sorted(dfs.keys())}")
     return dfs
 
-
+# Normalize any ID value to a string for comparison
 def normalize_id(value) -> str | None:
     """
     Convert any ID value to a plain string for safe cross-file comparison.
-
-    Handles all common storage formats:
-      - float  : 1007368913.0  →  '1007368913'
-      - int    : 1007368913    →  '1007368913'
-      - string : '1007368913'  →  '1007368913'
-      - None / NaN             →  None
+    Handles float, int, string, None/NaN.
     """
     if value is None:
         return None
     if isinstance(value, float) and np.isnan(value):
         return None
     try:
-        # int(float(...)) cleanly strips any trailing .0
         return str(int(float(str(value).strip())))
     except (ValueError, OverflowError):
         s = str(value).strip()
         return s if s else None
 
-
+# Clean DataFrame: drop empty columns, replace null-like strings with NaN
 def clean_df(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Drop fully-empty columns and normalise null-like strings.
-
-    KEY FIX: regex replacement is applied ONLY to object (string) columns.
-    Applying it to numeric columns raises a TypeError in pandas >= 2.0 and
-    silently corrupts results in older versions.
+    Drop fully-empty columns and normalize null-like strings (only on string columns).
     """
     if df is None or df.empty:
         return None
-
-    # Replace null-like strings only on text columns
     str_cols = df.select_dtypes(include="object").columns
     if len(str_cols) > 0:
         df = df.copy()
@@ -58,105 +46,88 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame | None:
             np.nan,
             regex=True,
         )
-
-    # Remove columns that are entirely NaN (no useful data)
     df = df.dropna(axis=1, how="all")
     return df if not df.empty else None
 
-
+# Build the complete patient record by linking all relevant data
 def get_full_patient_record(dfs: dict, patient_name: str) -> dict | None:
     """
-    Build the complete medical file for a patient by following all ID links
-    across the loaded JSON files.
-
-    Lookup strategy
-    ───────────────
-    Level 1 – direct link via patient ID:
-        Ag_Rdv       →  'Code Patient'
-        Consultation →  'Code patient'
-        Documents    →  'code patient'   ← note: all lowercase
-        tPostIT      →  'CodePat'
-
-    Level 2 – indirect link via consultation IDs (found at level 1):
-        tKERATO      →  'NumConsult'
-        tREFRACTION  →  'NumConsult'
-
+    Build the complete medical file for a patient by following all ID links across the loaded JSON files.
     Returns a dict of { section_name: DataFrame } or None if not found.
     """
-
-    # ── 1. Locate the patient in Patients.json ────────────────────────────
+    # Find patient in Patients.json
     df_patients = dfs.get("Patients")
     if df_patients is None:
         print("[ERROR] 'Patients' not found in loaded data.")
         return None
-
-    match = df_patients[
-        df_patients["NOM"].str.contains(patient_name, case=False, na=False)
-    ].copy()
-
+    import unicodedata
+    # Combine and normalize name and prename, remove accents
+    if "NOM" in df_patients.columns:
+        nom_col = df_patients["NOM"].fillna("").astype(str)
+    else:
+        nom_col = pd.Series("", index=df_patients.index)
+    if "Prénom" in df_patients.columns:
+        prenom_col = df_patients["Prénom"]
+    elif "PRENOM" in df_patients.columns:
+        prenom_col = df_patients["PRENOM"]
+    elif "Prenom" in df_patients.columns:
+        prenom_col = df_patients["Prenom"]
+    else:
+        prenom_col = pd.Series("", index=df_patients.index)
+    prenom_col = prenom_col.fillna("").astype(str)
+    combined_names = (nom_col + " " + prenom_col).str.lower()
+    combined_names = combined_names.str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
+    clean_search = unicodedata.normalize('NFKD', str(patient_name)).encode('ascii', 'ignore').decode('utf-8')
+    search_terms = clean_search.lower().split()
+    mask = pd.Series(True, index=df_patients.index)
+    for term in search_terms:
+        mask = mask & combined_names.str.contains(term, regex=False)
+    match = df_patients[mask].copy()
     if match.empty:
         print(f"[NOT FOUND] No patient matching '{patient_name}'.")
         return None
-
     patient_id = normalize_id(match.iloc[0]["Code patient"])
     print(f"[OK] Patient found — Code patient: {patient_id}")
-
     record = {"identity": clean_df(match)}
-
-    # ── 2. Build doctor ID → full name lookup from person.json ────────────
+    # Build doctor ID to name lookup
     doctor_map = {}
     if "person" in dfs:
         doctor_map = dfs["person"].set_index("ID")["Nom+Prénom"].to_dict()
-
-    # ── 3. Direct lookups by patient ID ──────────────────────────────────
-    # Each entry: section_key → exact column name in that JSON file
-    # Column names must match the raw JSON exactly (case-sensitive).
+    # Direct links by patient ID
     direct_links = {
-        "Ag_Rdv":       "Code Patient",   # capital C + P
-        "Consultation": "Code patient",   # capital C, lowercase p
-        "Documents":    "code patient",   # all lowercase  ← was a common bug source
-        "tPostIT":      "CodePat",        # camelCase — no Viale data expected here
+        "Ag_Rdv":       "Code Patient",
+        "Consultation": "Code patient",
+        "Documents":    "code patient",
+        "tPostIT":      "CodePat",
     }
-
     for section, id_col in direct_links.items():
         df = dfs.get(section)
         if df is None:
             print(f"[SKIP] '{section}' not found in loaded files.")
             continue
-
         if id_col not in df.columns:
-            print(f"[SKIP] Column '{id_col}' not found in '{section}' "
-                  f"(available: {list(df.columns[:5])} …).")
+            print(f"[SKIP] Column '{id_col}' not found in '{section}' (available: {list(df.columns[:5])} …).")
             continue
-
-        # Filter rows that belong to this patient
         mask = df[id_col].apply(normalize_id) == patient_id
         filtered = df[mask].copy()
-
         if filtered.empty:
             print(f"[EMPTY] '{section}': no rows for patient ID {patient_id}.")
             continue
-
-        # Enrich with doctor name wherever a doctor-code column is present
+        # Add doctor name if doctor code column exists
         for doc_col in ("Code Docteur", "Code Médecin"):
             if doc_col in filtered.columns:
                 filtered["Doctor_Name"] = filtered[doc_col].map(doctor_map)
                 break
-
         cleaned = clean_df(filtered)
         if cleaned is not None:
             record[section] = cleaned
             print(f"[OK] '{section}': {len(cleaned)} row(s) recovered.")
         else:
             print(f"[EMPTY] '{section}': data was all-NaN after cleaning.")
-
-    # ── 4. Indirect lookups via consultation IDs ──────────────────────────
-    # tKERATO and tREFRACTION are not linked directly to the patient;
-    # they reference the consultation via NumConsult.
+    # Indirect links via consultation IDs (for tKERATO, tREFRACTION)
     if "Consultation" not in record:
         print("[WARN] No 'Consultation' section — cannot resolve tKERATO / tREFRACTION.")
         return record
-
     consult_ids = (
         record["Consultation"]["N° consultation"]
         .apply(normalize_id)
@@ -164,26 +135,21 @@ def get_full_patient_record(dfs: dict, patient_name: str) -> dict | None:
         .tolist()
     )
     print(f"[INFO] {len(consult_ids)} consultation ID(s) to resolve for tKERATO / tREFRACTION.")
-
     indirect_links = {
         "tKERATO":     "NumConsult",
         "tREFRACTION": "NumConsult",
     }
-
     for section, id_col in indirect_links.items():
         df = dfs.get(section)
         if df is None:
             print(f"[SKIP] '{section}' not found in loaded files.")
             continue
-
         mask = df[id_col].apply(normalize_id).isin(consult_ids)
         filtered = df[mask].copy()
-
         cleaned = clean_df(filtered)
         if cleaned is not None:
             record[section] = cleaned
             print(f"[OK] '{section}': {len(cleaned)} row(s) recovered.")
         else:
             print(f"[EMPTY] '{section}': no matching rows for this patient's consultations.")
-
     return record
