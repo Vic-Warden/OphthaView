@@ -31,21 +31,49 @@ def normalize_id(value) -> str | None:
         s = str(value).strip()
         return s if s else None
 
+# Columns containing intentional multi-line free text — never wiped by the
+# blank-line regex, which would destroy values that contain internal blank lines.
+_PROTECTED_COLS = {
+    "Important", "IMPORTANT", "important",
+    "REMARQUES:", "Remarques", "REMARQUES",
+    "Notes importantes", "Note importante", "Note",
+    "Observation", "OBSERVATION",
+    "Ordonnance", "AutresPrescriptions",
+}
+
 # Clean DataFrame: drop empty columns, replace null-like strings with NaN
 def clean_df(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Drop fully-empty columns and normalize null-like strings (only on string columns).
+    Drop fully-empty columns and normalize null-like strings (only on string
+    columns). Protected columns (free-text clinical notes) skip the blank-line
+    regex so that multi-line values like the 'Important' field are never wiped.
     """
     if df is None or df.empty:
         return None
+    df = df.copy()
     str_cols = df.select_dtypes(include="object").columns
     if len(str_cols) > 0:
-        df = df.copy()
-        df[str_cols] = df[str_cols].replace(
-            [r"^\s*$", "NaN", "nan", "null", "None", ""],
-            np.nan,
-            regex=True,
-        )
+        normal_cols    = [c for c in str_cols if c not in _PROTECTED_COLS]
+        protected_cols = [c for c in str_cols if c in _PROTECTED_COLS]
+
+        if normal_cols:
+            df[normal_cols] = df[normal_cols].replace(
+                [r"^\s*$", "NaN", "nan", "null", "None", ""],
+                np.nan,
+                regex=True,
+            )
+        if protected_cols:
+            # Literal null-like strings only — no regex that could match blank lines
+            df[protected_cols] = df[protected_cols].replace(
+                ["NaN", "nan", "null", "None", ""],
+                np.nan,
+                regex=False,
+            )
+            # Wipe cells that are purely whitespace
+            for col in protected_cols:
+                mask = df[col].astype(str).str.strip() == ""
+                df.loc[mask, col] = np.nan
+
     df = df.dropna(axis=1, how="all")
     return df if not df.empty else None
 
