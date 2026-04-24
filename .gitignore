@@ -1,6 +1,9 @@
 # Ignore data files and environment variables
 data_raw/*.json
 
+# Ignore logs and temporary files
+guillaume/
+
 # Ignore notebooks containing sensitive execution outputs
 notebooks_executed/
 
