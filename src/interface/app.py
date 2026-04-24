@@ -1,9 +1,17 @@
+import base64
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import sys
+from pathlib import Path
 
-sys.path.append("src")
+_src = Path(__file__).resolve().parents[1]       # → src/
+_interface = Path(__file__).resolve().parent      # → src/interface/
+sys.path.insert(0, str(_src))
+sys.path.insert(0, str(_interface))
+
 from extraction import load_all_data, get_full_patient_record
+from medical_summary import render_medical_summary
 
 try:
     from fpdf import FPDF
@@ -14,18 +22,18 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
-# Page configuration
+# Page config
 st.set_page_config(
     page_title="Dossier Patient - Ophtalmologie",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for Streamlit UI
+# Global CSS
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 1.5rem; }
+        .block-container { padding-top: 1.2rem; }
         button[data-baseweb="tab"] {
             font-size: 0.875rem;
             font-weight: 600;
@@ -62,14 +70,21 @@ st.markdown(
             background: transparent !important;
             color: var(--text-color) !important;
         }
+        .patient-name-header {
+            font-size: 1.6rem;
+            font-weight: 800;
+            color: #1B3A6B;
+            margin-bottom: 0.15rem;
+            font-family: 'Segoe UI', sans-serif;
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Helper utilities
+# Utilities
 def is_empty(val) -> bool:
-    """Return True for any absent/empty value: None, NaN, NaT, blank string."""
+    """True for None, NaN, NaT, or blank string."""
     if val is None:
         return True
     try:
@@ -81,24 +96,29 @@ def is_empty(val) -> bool:
         return True
     return False
 
+
 def to_datetime_safe(series: pd.Series) -> pd.Series:
-    
-    # Use dayfirst=True for DD/MM/YYYY, fallback for older pandas
+    """Parse dates dayfirst; coerce errors to NaT."""
     try:
         return pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
     except ValueError:
         return pd.to_datetime(series, errors="coerce", dayfirst=True)
 
+
 def sort_by_date(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Sort df descending by date_col (NaT last)."""
     df = df.copy()
     df[date_col] = to_datetime_safe(df[date_col])
     return df.sort_values(date_col, ascending=False, na_position="last")
 
+
 def fmt_date_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Format datetime column as DD/MM/YYYY strings."""
     df = df.copy()
     if col in df.columns:
         df[col] = to_datetime_safe(df[col]).dt.strftime("%d/%m/%Y").fillna("")
     return df
+
 
 def sort_exams_via_consult(
     exam_df: pd.DataFrame,
@@ -108,10 +128,7 @@ def sort_exams_via_consult(
     consult_id_col: str = "N° consultation",
     keep_date: bool = False,
 ) -> pd.DataFrame:
-    """
-    Sort tKERATO / tREFRACTION rows by their linked consultation date.
-    If keep_date=True, the formatted date is kept as '_date_tmp' for display.
-    """
+    """Sort tKERATO/tREFRACTION rows by linked consultation date."""
     if exam_df is None or exam_df.empty:
         return exam_df
     date_lookup = (
@@ -128,8 +145,9 @@ def sort_exams_via_consult(
         merged = merged.drop(columns=["_date_tmp"])
     return merged.reset_index(drop=True)
 
+
 def classify_od_og(col_name: str) -> str:
-    """Classify a column as 'OD', 'OG', or 'other' based on its suffix."""
+    """Return 'OD', 'OG', or 'other' based on column name suffix."""
     name = col_name.strip().upper().replace("_", "").replace(" ", "")
     if name.endswith("OD"):
         return "OD"
@@ -137,16 +155,18 @@ def classify_od_og(col_name: str) -> str:
         return "OG"
     return "other"
 
+
 def clean_row_items(row: pd.Series, exclude_cols: list = None) -> list:
-    """Return (col, val) pairs, filtering empty values and excluded columns."""
+    """Return (col, val) pairs, skipping empty values and excluded columns."""
     exclude = set(exclude_cols or [])
     return [
         (col, val) for col, val in row.items()
         if col not in exclude and not is_empty(val)
     ]
 
+
 def kv_html(label: str, value) -> str:
-    """Render a key-value pair as styled HTML."""
+    """Render a label/value pair as styled HTML."""
     return (
         f'<p class="field-label">{label}</p>'
         f'<p class="field-value">{value}</p>'
@@ -154,7 +174,7 @@ def kv_html(label: str, value) -> str:
 
 # Rendering helpers
 def render_consultation_row(row: pd.Series, exclude_cols: list = None):
-    """Render consultation fields in a responsive 3-column grid (empty values omitted)."""
+    """Render consultation fields in a 3-column grid, skipping empty values."""
     items = clean_row_items(row, exclude_cols)
     if not items:
         st.caption("Aucune donnée disponible.")
@@ -167,15 +187,14 @@ def render_consultation_row(row: pd.Series, exclude_cols: list = None):
             with cols[j]:
                 st.markdown(kv_html(col_name, val), unsafe_allow_html=True)
 
+
 def render_exam_row(row: pd.Series, exclude_cols: list = None):
-    """
-    Render a tKERATO or tREFRACTION row.
-    OD columns in left, OG columns in right, others below.
-    """
+    """Render tKERATO/tREFRACTION row: OD left, OG right, other fields below."""
     items       = clean_row_items(row, exclude_cols)
     od_items    = [(k, v) for k, v in items if classify_od_og(k) == "OD"]
     og_items    = [(k, v) for k, v in items if classify_od_og(k) == "OG"]
     other_items = [(k, v) for k, v in items if classify_od_og(k) == "other"]
+
     if od_items or og_items:
         col_od, col_og = st.columns(2)
         with col_od:
@@ -194,6 +213,7 @@ def render_exam_row(row: pd.Series, exclude_cols: list = None):
             for k, v in og_items:
                 label = k.upper().rstrip("OG").rstrip("_").strip() or k
                 st.markdown(kv_html(label, v), unsafe_allow_html=True)
+
     if other_items:
         if od_items or og_items:
             st.divider()
@@ -202,16 +222,13 @@ def render_exam_row(row: pd.Series, exclude_cols: list = None):
         for i, (k, v) in enumerate(other_items):
             with cols[i % chunk_size]:
                 st.markdown(kv_html(k, v), unsafe_allow_html=True)
+
     if not od_items and not og_items and not other_items:
         st.caption("Aucune donnée disponible.")
 
-# PDF generation (requires: pip install fpdf2)
+# PDF helpers (requires fpdf2)
 def _register_fonts(pdf):
-    """
-    Try to load DejaVuSansCondensed (bundled with fpdf2) as 'DejaVu'.
-    If not found, fallback to Helvetica and return False.
-    Returns True if DejaVu loaded, False if fallback used.
-    """
+    """Load DejaVuSansCondensed from fpdf2 bundle. Returns True on success."""
     try:
         from pathlib import Path
         import fpdf as _fpdf_pkg
@@ -231,7 +248,9 @@ def _register_fonts(pdf):
     except Exception:
         return False
 
+
 def _pdf_section_title(pdf, title: str, font_main="DejaVu", font_bold="B"):
+    """Render a filled section-title banner in the PDF."""
     pdf.set_font(font_main, font_bold, 11)
     pdf.set_fill_color(237, 242, 251)
     pdf.set_text_color(30, 64, 175)
@@ -239,38 +258,34 @@ def _pdf_section_title(pdf, title: str, font_main="DejaVu", font_bold="B"):
     pdf.set_text_color(0, 0, 0)
     pdf.ln(1)
 
+
 def _pdf_entry_header(pdf, label: str, font_main="DejaVu", font_bi="BI"):
+    """Italic sub-entry header line."""
     pdf.set_font(font_main, font_bi, 9)
     pdf.set_text_color(55, 65, 81)
     pdf.cell(0, 6, label, ln=True)
     pdf.set_text_color(0, 0, 0)
 
+
 def _pdf_kv(pdf, key: str, val, font_main="DejaVu", font_bold="B"):
+    """Key-value row. Replaces problematic Unicode chars with ASCII."""
+    _replacements = str.maketrans({
+        "œ": "oe", "Œ": "OE",
+        "—": "-",  "–": "-",
+        "\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"',
+        "«": '"',  "»": '"',
+        "…": "...",
+    })
+    safe_key = str(key).translate(_replacements)
+    safe_val = str(val).translate(_replacements)
+
     pdf.set_font(font_main, font_bold, 8)
-    
-    # Replace problematic Unicode characters for PDF compatibility
-    safe_key = (
-        str(key)
-        .replace("œ", "oe").replace("Œ", "OE")
-        .replace("—", "-").replace("–", "-")
-        .replace("’", "'").replace("‘", "'")
-        .replace("“", '"').replace("”", '"')
-        .replace("«", '"').replace("»", '"')
-        .replace("…", "...")
-    )
-    safe_val = (
-        str(val)
-        .replace("œ", "oe").replace("Œ", "OE")
-        .replace("—", "-").replace("–", "-")
-        .replace("’", "'").replace("‘", "'")
-        .replace("“", '"').replace("”", '"')
-        .replace("«", '"').replace("»", '"')
-        .replace("…", "...")
-    )
     pdf.cell(58, 5, safe_key[:40], border=0)
     pdf.set_font(font_main, "", 8)
     pdf.multi_cell(0, 5, safe_val, border=0)
     pdf.set_x(pdf.l_margin)
+
 
 def generate_pdf_bytes(
     record: dict,
@@ -278,18 +293,17 @@ def generate_pdf_bytes(
     dob_str: str,
     patient_id: str,
 ) -> bytes:
-    """Build a clinical PDF from a record dict; empty fields are silently omitted."""
+    """Build a clinical PDF from record. Empty/NaN fields are skipped."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_margins(15, 15, 15)
     has_dejavu = _register_fonts(pdf)
-    font_main = "DejaVu" if has_dejavu else "Helvetica"
-    font_bold = "B"
-    font_italic = "I"
-    font_bi = "BI" if has_dejavu else "B"
-    
-    # PDF header
+    font_main   = "DejaVu" if has_dejavu else "Helvetica"
+    font_bold   = "B"
+    font_bi     = "BI" if has_dejavu else "B"
+
+    # --- Header ---
     pdf.set_font(font_main, font_bold, 15)
     pdf.set_text_color(17, 24, 39)
     pdf.cell(0, 9, "Dossier Medical - Ophtalmologie", ln=True, align="C")
@@ -304,8 +318,8 @@ def generate_pdf_bytes(
     pdf.line(15, pdf.get_y() + 2, 195, pdf.get_y() + 2)
     pdf.ln(5)
     pdf.set_text_color(0, 0, 0)
-    
-    # Consultations
+
+    # --- Consultations ---
     consult_df = record.get("Consultation")
     if consult_df is not None and not consult_df.empty:
         df = sort_by_date(consult_df.copy(), "Date") if "Date" in consult_df.columns else consult_df.copy()
@@ -318,38 +332,50 @@ def generate_pdf_bytes(
                  if c in row.index and not is_empty(row[c])),
                 "",
             )
-            _pdf_entry_header(pdf, f"Consultation du {date_val}" + (f"  -  {subtitle}" if subtitle else ""), font_main, font_bi)
+            _pdf_entry_header(
+                pdf,
+                f"Consultation du {date_val}" + (f"  -  {subtitle}" if subtitle else ""),
+                font_main, font_bi,
+            )
             for col, val in row.items():
                 if col == "Date" or is_empty(val):
                     continue
                 _pdf_kv(pdf, col, val, font_main, font_bold)
             pdf.ln(3)
-    
-    # Keratometry
+
+    # --- Keratometry ---
     kerato_df = record.get("tKERATO")
     if kerato_df is not None and not kerato_df.empty:
         _pdf_section_title(pdf, "Keratomètrie", font_main, font_bold)
         for _, row in kerato_df.iterrows():
-            _pdf_entry_header(pdf, f"Examen - Consultation n° {row.get('NumConsult', '-')}" , font_main, font_bi)
+            _pdf_entry_header(
+                pdf,
+                f"Examen - Consultation n° {row.get('NumConsult', '-')}",
+                font_main, font_bi,
+            )
             for col, val in row.items():
                 if is_empty(val):
                     continue
                 _pdf_kv(pdf, col, val, font_main, font_bold)
             pdf.ln(3)
-    
-    # Refraction
+
+    # --- Refraction ---
     refrac_df = record.get("tREFRACTION")
     if refrac_df is not None and not refrac_df.empty:
         _pdf_section_title(pdf, "Refraction", font_main, font_bold)
         for _, row in refrac_df.iterrows():
-            _pdf_entry_header(pdf, f"Examen - Consultation n° {row.get('NumConsult', '-')}" , font_main, font_bi)
+            _pdf_entry_header(
+                pdf,
+                f"Examen - Consultation n° {row.get('NumConsult', '-')}",
+                font_main, font_bi,
+            )
             for col, val in row.items():
                 if is_empty(val):
                     continue
                 _pdf_kv(pdf, col, val, font_main, font_bold)
             pdf.ln(3)
-    
-    # Documents
+
+    # --- Documents ---
     docs_df = record.get("Documents")
     if docs_df is not None and not docs_df.empty:
         df = sort_by_date(docs_df.copy(), "Date") if "Date" in docs_df.columns else docs_df.copy()
@@ -358,22 +384,28 @@ def generate_pdf_bytes(
         for _, row in df.iterrows():
             date_val = row.get("Date", "-")
             desc = row.get("DESCRIPTIONS", "") if not is_empty(row.get("DESCRIPTIONS")) else ""
-            _pdf_entry_header(pdf, f"Document du {date_val}" + (f"  -  {desc}" if desc else ""), font_main, font_bi)
+            _pdf_entry_header(
+                pdf,
+                f"Document du {date_val}" + (f"  -  {desc}" if desc else ""),
+                font_main, font_bi,
+            )
             for col, val in row.items():
                 if col in ("Date", "DESCRIPTIONS") or is_empty(val):
                     continue
                 _pdf_kv(pdf, col, val, font_main, font_bold)
             pdf.ln(3)
+
     return bytes(pdf.output())
 
-# Data initialization
+# Data initialisation — cached so JSON files are only loaded once per session
 @st.cache_resource(show_spinner="Chargement des données…")
 def init_data() -> dict:
     return load_all_data("data_raw")
 
+
 all_data = init_data()
 
-# Sidebar
+# Sidebar — patient search
 with st.sidebar:
     st.markdown("### Recherche patient")
     st.divider()
@@ -384,7 +416,7 @@ with st.sidebar:
     )
     st.caption("Vous pouvez chercher par nom, prénom, ou les deux. L'ordre n'a pas d'importance.")
 
-# Main content
+# Guard: nothing to show until a name is entered
 if not search_query:
     st.markdown("## Dossier Patient")
     st.info("Saisissez un nom dans la barre latérale pour afficher le dossier médical.")
@@ -397,150 +429,35 @@ if record is None:
     st.error(f"Aucun patient trouvé pour la recherche « {search_query} ».")
     st.stop()
 
-# Identity header
+# Patient identity header
 id_df = record.get("identity")
 full_name, dob_str, patient_id = "-", "-", "-"
 if id_df is not None and not id_df.empty:
-    row       = id_df.iloc[0]
-    full_name = f"{row.get('NOM', '')} {row.get('Prénom', '')}".strip() or "-"
-    dob       = row.get("Date Naissance", None)
-    dob_str   = (
+    row        = id_df.iloc[0]
+    full_name  = f"{row.get('NOM', '')} {row.get('Prénom', '')}".strip() or "-"
+    dob        = row.get("Date Naissance", None)
+    dob_str    = (
         pd.to_datetime(dob, errors="coerce").strftime("%d/%m/%Y")
         if not is_empty(dob) else "-"
     )
     patient_id = str(row.get("Code patient", "-"))
 
-st.markdown(f"## {full_name}")
-col_a, col_b, col_c, col_d = st.columns(4)
-col_a.metric("Identifiant", patient_id)
-col_b.metric("Date de naissance", dob_str)
-col_c.metric("Consultations", len(record.get("Consultation", pd.DataFrame())))
-col_d.metric("Documents", len(record.get("Documents", pd.DataFrame())))
-
-# Full dossier PDF button
-if PDF_AVAILABLE:
-    st.divider()
-    if st.button("Générer le dossier complet (PDF)", type="secondary"):
-        with st.spinner("Génération du PDF…"):
-            pdf_bytes = generate_pdf_bytes(record, full_name, dob_str, patient_id)
-        st.download_button(
-            label="Télécharger le dossier complet",
-            data=pdf_bytes,
-            file_name=f"dossier_{full_name.replace(' ', '_')}.pdf",
-            mime="application/pdf",
-            key="dl_full_dossier",
-        )
+# Slim patient name + date of birth header
+st.markdown(
+    f'<div class="patient-name-header">{full_name}</div>',
+    unsafe_allow_html=True,
+)
+if dob_str and dob_str != "-":
+    st.caption(f"Né(e) le {dob_str}")
 
 st.divider()
 
-# Tabs
-tab_consult, tab_exams, tab_docs = st.tabs([
-    "Consultations", "Examens techniques", "Documents"
-])
-
-# Consultations tab
-with tab_consult:
-    consult_df = record.get("Consultation")
-    if consult_df is None or consult_df.empty:
-        st.info("Aucune consultation enregistrée pour ce patient.")
-    else:
-        if "Date" in consult_df.columns:
-            consult_df = sort_by_date(consult_df, "Date")
-            consult_df = fmt_date_col(consult_df, "Date")
-        st.caption(f"{len(consult_df)} consultation(s) - ordre chronologique décroissant")
-        for idx, row in consult_df.iterrows():
-            date_val    = row.get("Date", "")
-            date_label  = date_val if not is_empty(date_val) else "Date inconnue"
-            subtitle    = next(
-                (str(row[c]) for c in ("DOMINANTE", "Motif", "Motif consultation", "Acte", "Type")
-                 if c in row.index and not is_empty(row[c])),
-                "",
-            )
-            expander_title = f"Consultation du {date_label}" + (f"  -  {subtitle}" if subtitle else "")
-            with st.expander(expander_title, expanded=False):
-                if PDF_AVAILABLE:
-                    consult_id = row.get("N° consultation")
-                    if pd.isna(consult_id):
-                        consult_id = row.get("NumConsult")
-                    single = {"Consultation": pd.DataFrame([row])}
-                    if not pd.isna(consult_id):
-                        kerato_df = record.get("tKERATO")
-                        if kerato_df is not None and not kerato_df.empty:
-                            single["tKERATO"] = kerato_df[kerato_df["NumConsult"].astype(str) == str(consult_id)]
-                        refrac_df = record.get("tREFRACTION")
-                        if refrac_df is not None and not refrac_df.empty:
-                            single["tREFRACTION"] = refrac_df[refrac_df["NumConsult"].astype(str) == str(consult_id)]
-                    docs_df = record.get("Documents")
-                    if docs_df is not None and not docs_df.empty:
-                        if "NumConsult" in docs_df.columns and not pd.isna(consult_id):
-                            single["Documents"] = docs_df[docs_df["NumConsult"].astype(str) == str(consult_id)]
-                        elif "N° consultation" in docs_df.columns and not pd.isna(consult_id):
-                            single["Documents"] = docs_df[docs_df["N° consultation"].astype(str) == str(consult_id)]
-                        else:
-                            single["Documents"] = docs_df[docs_df["Date"] == row.get("Date")]
-                    pdf_c = generate_pdf_bytes(single, full_name, dob_str, patient_id)
-                    st.download_button(
-                        label="Télécharger cette consultation (PDF)",
-                        data=pdf_c,
-                        file_name=f"consultation_{date_label.replace('/', '-')}_{full_name.replace(' ', '_')}.pdf",
-                        mime="application/pdf",
-                        key=f"dl_consult_{idx}",
-                    )
-                    st.divider()
-                render_consultation_row(row, exclude_cols=["Date"])
-
-# Exams tab
-with tab_exams:
-    consult_raw = record.get("Consultation")
-    for section_label, section_key in [
-        ("Kératométrie", "tKERATO"),
-        ("Réfraction",   "tREFRACTION"),
-    ]:
-        st.markdown(f"### {section_label}")
-        exam_df = record.get(section_key)
-        if exam_df is None or exam_df.empty:
-            st.info(f"Aucune donnée de {section_label.lower()} pour ce patient.")
-        else:
-            if consult_raw is not None and not consult_raw.empty:
-                exam_df = sort_exams_via_consult(exam_df, consult_raw, keep_date=True)
-            st.caption(f"{len(exam_df)} enregistrement(s) - ordre chronologique décroissant")
-            for idx, row in exam_df.iterrows():
-                date_val    = row.get("_date_tmp", "")
-                num_consult = row.get("NumConsult", "-")
-                date_label  = f"du {date_val}" if not is_empty(date_val) else f"- Consultation n° {num_consult}"
-                expander_title = f"{section_label} {date_label}"
-                with st.expander(expander_title, expanded=False):
-                    render_exam_row(row, exclude_cols=["_date_tmp"])
-        st.divider()
-
-# Documents tab
-with tab_docs:
-    docs_df = record.get("Documents")
-    if docs_df is None or docs_df.empty:
-        st.info("Aucun document associé à ce patient.")
-    else:
-        if "Date" in docs_df.columns:
-            docs_df = sort_by_date(docs_df, "Date")
-            docs_df = fmt_date_col(docs_df, "Date")
-        st.caption(f"{len(docs_df)} document(s) - ordre chronologique décroissant")
-        for idx, row in docs_df.iterrows():
-            date_val   = row.get("Date", "")
-            date_label = date_val if not is_empty(date_val) else "Date inconnue"
-            desc       = next(
-                (str(row[c]) for c in ("DESCRIPTIONS", "Type", "Libellé")
-                 if c in row.index and not is_empty(row[c])),
-                "",
-            )
-            expander_title = f"Document du {date_label}" + (f"  -  {desc}" if desc else "")
-            with st.expander(expander_title, expanded=False):
-                items = clean_row_items(row, exclude_cols=["Date", "DESCRIPTIONS"])
-                if not items:
-                    st.caption("Aucune métadonnée supplémentaire disponible.")
-                else:
-                    chunk_size = 3
-                    for i in range(0, len(items), chunk_size):
-                        chunk = items[i : i + chunk_size]
-                        cols  = st.columns(chunk_size)
-                        for j, (col_name, val) in enumerate(chunk):
-                            with cols[j]:
-                                st.markdown(kv_html(col_name, val), unsafe_allow_html=True)
+# Care pathway summary (v13) — collapses sidebar automatically
+render_medical_summary(
+    record,
+    generate_pdf_bytes_fn=generate_pdf_bytes if PDF_AVAILABLE else None,
+    pdf_available=PDF_AVAILABLE,
+    full_name=full_name,
+    dob_str=dob_str,
+    patient_id=patient_id,
+)
