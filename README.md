@@ -35,7 +35,12 @@ DMP-EXTRACTOR/
 │   ├── extraction.py           # Data loading, cleaning, ID normalization, record assembly
 │   └── interface/
 │       ├── app.py              # Streamlit entry point, PDF generation
-│       └── medical_summary.py  # Dashboard rendering (360° card, act table, IOP chart)
+│       ├── medical_summary.py  # Orchestrator — public API (render, analyse, export)
+│       ├── _extractors.py      # Clinical data extractors (AV, IOP, treatments, Rx…)
+│       ├── _actes.py           # Act table: data builder + Streamlit renderer
+│       ├── _card.py            # CSS, HTML helpers, 360° patient card
+│       ├── _pio_chart.py       # IOP Plotly chart + Streamlit renderer
+│       └── _utils.py           # Shared utilities (date parsing, DataFrame helpers…)
 ├── requirements.txt
 └── README.md
 ```
